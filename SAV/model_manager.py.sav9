@@ -1,0 +1,661 @@
+import os
+import re
+import shutil
+import signal
+import subprocess
+import threading
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set
+
+import requests
+
+from config import (
+    VLLM_HOST,
+    VLLM_PORT,
+    VLLM_API_KEY,
+    HF_HOME,
+    DEFAULT_MAX_MODEL_LEN,
+    DEFAULT_GPU_MEMORY_UTILIZATION,
+    DEFAULT_DTYPE,
+)
+
+
+class VLLMManager:
+    def __init__(self):
+        self.proc: Optional[subprocess.Popen] = None
+        self.current_model: Optional[str] = None
+        self.log_buffer: List[str] = []
+        self.log_lock = threading.Lock()
+        self.reader_thread = None
+        self._current_enable_aiter = False
+        self._current_use_v1 = True
+        self._current_tensor_parallel_size = 1
+        self._selected_gpu_indices: Optional[List[int]] = None  # None = tous les GPUs
+
+    def _append_log(self, line: str):
+        with self.log_lock:
+            self.log_buffer.append(line)
+            self.log_buffer = self.log_buffer[-500:]
+
+    def get_logs(self) -> str:
+        with self.log_lock:
+            return "".join(self.log_buffer)
+
+    def clear_logs(self):
+        with self.log_lock:
+            self.log_buffer = []
+
+    def current_runtime_config(self) -> Dict[str, object]:
+        return {
+            "enable_aiter": self._current_enable_aiter,
+            "use_v1": self._current_use_v1,
+            "tensor_parallel_size": self._current_tensor_parallel_size,
+        }
+
+    def _health_url(self) -> str:
+        return f"http://{VLLM_HOST}:{VLLM_PORT}/health"
+
+    def _models_url(self) -> str:
+        return f"http://{VLLM_HOST}:{VLLM_PORT}/v1/models"
+
+    def is_server_ready(self) -> bool:
+        try:
+            r = requests.get(self._health_url(), timeout=3)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def is_model_loaded(self) -> bool:
+        try:
+            r = requests.get(
+                self._models_url(),
+                headers={"Authorization": f"Bearer {VLLM_API_KEY}"},
+                timeout=3,
+            )
+
+            if r.status_code != 200:
+                return False
+
+            data = r.json()
+            if not data.get("data"):
+                return False
+
+            loaded_models = [m.get("id") for m in data["data"] if isinstance(m, dict)]
+            return self.current_model in loaded_models
+        except Exception:
+            return False
+
+    def get_status(self) -> str:
+        if self.proc is None:
+            info = self.get_runtime_info()
+            return (
+                "No vLLM server is currently running.\n"
+                f"Visible GPUs: {info['available_gpu_count']}\n"
+                f"Suggested TP values: {info['tp_choices']}"
+            )
+
+        ret = self.proc.poll()
+        logs = self.get_logs()
+        runtime = self.current_runtime_config()
+        runtime_summary = (
+            f"model={self.current_model} | engine={'V1' if runtime['use_v1'] else 'V0'} "
+            f"| AITER={'on' if runtime['enable_aiter'] else 'off'} "
+            f"| TP={runtime['tensor_parallel_size']}"
+        )
+
+        if ret is not None:
+            if "Free memory on device" in logs and "gpu memory utilization" in logs.lower():
+                return (
+                    "❌ Not enough free GPU memory to load the model.\n"
+                    f"Runtime: {runtime_summary}\n\nLogs:\n{logs}"
+                )
+            return (
+                f"❌ vLLM exited unexpectedly (return code {ret}).\n"
+                f"Runtime: {runtime_summary}\n\nLogs:\n{logs}"
+            )
+
+        if self.is_model_loaded():
+            return f"✅ vLLM ready (model loaded).\nRuntime: {runtime_summary}\n\nLogs:\n{logs}"
+
+        if self.is_server_ready():
+            return f"⏳ vLLM API started — model loading...\nRuntime: {runtime_summary}\n\nLogs:\n{logs}"
+
+        return f"⏳ vLLM process starting...\nRuntime: {runtime_summary}\n\nLogs:\n{logs}"
+
+    def _reader(self):
+        if self.proc is None or self.proc.stdout is None:
+            return
+
+        ignored_patterns = [
+            '/health HTTP/1.1',
+            '/v1/models HTTP/1.1',
+        ]
+
+        for line in iter(self.proc.stdout.readline, ""):
+            if not line:
+                break
+
+            if any(pattern in line for pattern in ignored_patterns):
+                continue
+
+            self._append_log(line)
+
+    def _count_visible_devices_from_env(self) -> Optional[int]:
+        for env_name in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+            raw = os.environ.get(env_name)
+            if raw is None:
+                continue
+
+            raw = raw.strip()
+            if raw == "":
+                return 0
+
+            lowered = raw.lower()
+            if lowered == "all":
+                return None
+            if lowered == "none":
+                return 0
+
+            parts = [part.strip() for part in raw.split(",") if part.strip()]
+            return len(parts)
+
+        return None
+
+    def _count_devices_with_torch(self) -> Optional[int]:
+        try:
+            import torch
+            return int(torch.cuda.device_count())
+        except Exception:
+            return None
+
+    def _run_cli_count(self, cmd: List[str]) -> Optional[int]:
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            return len(lines) if lines else None
+        except Exception:
+            return None
+
+    def get_available_gpu_count(self) -> int:
+        count = self._count_visible_devices_from_env()
+        if count is not None:
+            return max(0, count)
+
+        count = self._count_devices_with_torch()
+        if count is not None:
+            return max(0, count)
+
+        rocm_smi = shutil.which("rocm-smi")
+        if rocm_smi:
+            count = self._run_cli_count([rocm_smi, "--showid"])
+            if count is not None:
+                return max(0, count)
+
+        amd_smi = shutil.which("amd-smi")
+        if amd_smi:
+            count = self._run_cli_count([amd_smi, "list"])
+            if count is not None:
+                return max(0, count)
+
+        nvidia_smi = shutil.which("nvidia-smi")
+        if nvidia_smi:
+            count = self._run_cli_count([nvidia_smi, "--list-gpus"])
+            if count is not None:
+                return max(0, count)
+
+        return 1
+
+    def get_runtime_info(self) -> Dict[str, object]:
+        gpu_count = max(1, self.get_available_gpu_count())
+        return {
+            "available_gpu_count": gpu_count,
+            "tp_choices": list(range(1, gpu_count + 1)),
+            "default_tp": 1,
+        }
+
+    def get_all_gpu_list(self) -> List[Dict[str, Any]]:
+        """
+        Retourne la liste de tous les GPUs physiques détectés via /sys/class/drm,
+        indépendamment de HIP_VISIBLE_DEVICES.
+        Chaque entrée: {index, card, total_gb, used_gb, free_gb, label}
+        """
+        from pathlib import Path
+
+        gpus = []
+        drm_root = Path("/sys/class/drm")
+        idx = 0
+        for card in sorted(drm_root.glob("card[0-9]*")):
+            device = card / "device"
+            total_file = device / "mem_info_vram_total"
+            used_file = device / "mem_info_vram_used"
+            if not total_file.exists() or not used_file.exists():
+                continue
+            try:
+                total = int(total_file.read_text().strip())
+                used = int(used_file.read_text().strip())
+                free = max(total - used, 0)
+
+                def to_gb(v):
+                    return round(v / (1024 ** 3), 1)
+
+                label = f"GPU {idx} ({card.name}) — {to_gb(total):.0f} GB total"
+                gpus.append({
+                    "index": idx,
+                    "card": card.name,
+                    "total_gb": to_gb(total),
+                    "used_gb": to_gb(used),
+                    "free_gb": to_gb(free),
+                    "label": label,
+                })
+                idx += 1
+            except Exception:
+                idx += 1
+                continue
+        return gpus
+
+    def _get_visible_device_indices(self) -> Optional[List[int]]:
+        """
+        Retourne les indices de GPU définis par HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES.
+
+        Exemples:
+          HIP_VISIBLE_DEVICES=1,3  -> [1, 3]
+          unset / all              -> None   (pas de filtre)
+          "" / none                -> []
+        """
+        for env_name in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+            raw = os.environ.get(env_name)
+            if raw is None:
+                continue
+
+            raw = raw.strip()
+            if raw == "":
+                return []
+
+            lowered = raw.lower()
+            if lowered == "all":
+                return None
+            if lowered == "none":
+                return []
+
+            result = []
+            for part in raw.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                try:
+                    result.append(int(part))
+                except ValueError:
+                    continue
+            return result
+
+        return None
+
+    def _normalize_bdf(self, bdf: str) -> str:
+        """
+        Normalise un BDF PCI au format canonique: 0000:xx:yy.z
+        """
+        bdf = bdf.strip().lower().strip("[]")
+
+        if re.match(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$", bdf):
+            return bdf
+
+        if re.match(r"^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$", bdf):
+            return f"0000:{bdf}"
+
+        return bdf
+
+    def _get_rocm_smi_bus_map(self) -> Dict[int, str]:
+        """
+        Retourne un mapping {index_rocm: pci_bdf}
+        Exemple:
+          {0: '0000:c1:00.0', 1: '0000:c6:00.0', ...}
+        """
+        rocm_smi = shutil.which("rocm-smi")
+        if not rocm_smi:
+            return {}
+
+        try:
+            result = subprocess.run(
+                [rocm_smi, "--showbus"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            text = result.stdout
+        except Exception:
+            return {}
+
+        bus_map: Dict[int, str] = {}
+
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            # Exemple possible:
+            # GPU[0] : PCI Bus: 0000:C1:00.0
+            m1 = re.search(
+                r"GPU\[(\d+)\].*?([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])",
+                line,
+            )
+            if m1:
+                idx = int(m1.group(1))
+                bus_map[idx] = self._normalize_bdf(m1.group(2))
+                continue
+
+            # Autre forme possible:
+            # 0  0000:C1:00.0
+            m2 = re.match(
+                r"^(\d+)\s+([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])\b",
+                line,
+            )
+            if m2:
+                idx = int(m2.group(1))
+                bus_map[idx] = self._normalize_bdf(m2.group(2))
+                continue
+
+        return bus_map
+
+    def _get_selected_bdfs(self) -> Optional[Set[str]]:
+        """
+        Retourne les BDF physiques sélectionnés selon HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES.
+        None = pas de filtre.
+        """
+        visible_indices = self._get_visible_device_indices()
+        if visible_indices is None:
+            return None
+        if not visible_indices:
+            return set()
+
+        rocm_bus_map = self._get_rocm_smi_bus_map()
+        if not rocm_bus_map:
+            # Fallback: pas de mapping fiable => ne pas filtrer
+            return None
+
+        selected = set()
+        for idx in visible_indices:
+            bdf = rocm_bus_map.get(idx)
+            if bdf:
+                selected.add(bdf)
+        return selected
+
+    def _get_card_bdf(self, card: Path) -> Optional[str]:
+        """
+        Lit le BDF PCI correspondant à /sys/class/drm/cardX
+        """
+        try:
+            real_dev = (card / "device").resolve()
+            return self._normalize_bdf(real_dev.name)
+        except Exception:
+            return None
+
+    def get_gpu_memory_info(self, only_vllm_visible: bool = True, gpu_indices: Optional[List[int]] = None):
+        """
+        Si gpu_indices est fourni, filtre uniquement les GPUs correspondant à ces indices
+        (basé sur l'ordre de découverte dans /sys/class/drm/card*).
+        Sinon, utilise la logique HIP_VISIBLE_DEVICES habituelle.
+        """
+        gpus = []
+        drm_root = Path("/sys/class/drm")
+        selected_bdfs = self._get_selected_bdfs() if only_vllm_visible and gpu_indices is None else None
+
+        card_idx = 0
+        for card in sorted(drm_root.glob("card[0-9]*")):
+            device = card / "device"
+            total_file = device / "mem_info_vram_total"
+            used_file = device / "mem_info_vram_used"
+
+            if not total_file.exists() or not used_file.exists():
+                continue
+
+            # Filtre par indices explicites (sélection UI)
+            if gpu_indices is not None:
+                if card_idx not in gpu_indices:
+                    card_idx += 1
+                    continue
+            elif selected_bdfs is not None:
+                card_bdf = self._get_card_bdf(card)
+                if card_bdf not in selected_bdfs:
+                    card_idx += 1
+                    continue
+
+            card_bdf = self._get_card_bdf(card)
+
+            try:
+                total = int(total_file.read_text().strip())
+                used = int(used_file.read_text().strip())
+                free = max(total - used, 0)
+                used_pct = (used / total * 100.0) if total > 0 else 0.0
+
+                gpus.append(
+                    {
+                        "gpu": card.name,
+                        "gpu_index": card_idx,
+                        "bdf": card_bdf or "",
+                        "total_bytes": total,
+                        "used_bytes": used,
+                        "free_bytes": free,
+                        "used_pct": used_pct,
+                    }
+                )
+            except Exception:
+                pass
+            card_idx += 1
+
+        return gpus
+
+    def get_gpu_memory_summary(self, gpu_indices: Optional[List[int]] = None):
+        gpus = self.get_gpu_memory_info(only_vllm_visible=gpu_indices is None, gpu_indices=gpu_indices)
+        if not gpus:
+            return {
+                "total_gb": 0.0,
+                "used_gb": 0.0,
+                "free_gb": 0.0,
+                "per_gpu": "No VRAM info detected for vLLM-visible GPUs",
+            }
+
+        total = sum(x["total_bytes"] for x in gpus)
+        used = sum(x["used_bytes"] for x in gpus)
+        free = sum(x["free_bytes"] for x in gpus)
+
+        def to_gb(v):
+            return v / (1024 ** 3)
+
+        per_gpu = " | ".join(
+            f"{x['gpu']}: {to_gb(x['used_bytes']):.2f} / {to_gb(x['total_bytes']):.2f} GB ({x['used_pct']:.1f}%)"
+            for x in gpus
+        )
+
+        return {
+            "total_gb": round(to_gb(total), 2),
+            "used_gb": round(to_gb(used), 2),
+            "free_gb": round(to_gb(free), 2),
+            "per_gpu": per_gpu,
+        }
+
+    def get_gpu_memory_snapshot_for_benchmark(self, gpu_indices: Optional[List[int]] = None):
+        gpus = self.get_gpu_memory_info(only_vllm_visible=gpu_indices is None, gpu_indices=gpu_indices)
+        if not gpus:
+            return {
+                "used_vram_gb": 0.0,
+                "total_vram_gb": 0.0,
+                "free_vram_gb": 0.0,
+                "per_gpu_used_gb": "",
+            }
+
+        def to_gb(v):
+            return v / (1024 ** 3)
+
+        total = sum(x["total_bytes"] for x in gpus)
+        used = sum(x["used_bytes"] for x in gpus)
+        free = sum(x["free_bytes"] for x in gpus)
+
+        per_gpu_used = " | ".join(
+            f"{x['gpu']}:{to_gb(x['used_bytes']):.2f}/{to_gb(x['total_bytes']):.2f}GB ({x['used_pct']:.1f}%)"
+            for x in gpus
+        )
+
+        return {
+            "used_vram_gb": round(to_gb(used), 2),
+            "total_vram_gb": round(to_gb(total), 2),
+            "free_vram_gb": round(to_gb(free), 2),
+            "per_gpu_used_gb": per_gpu_used,
+        }
+
+    def stop_server(self):
+        if self.proc is not None and self.proc.poll() is None:
+            self._append_log("\n[manager] Stopping vLLM server...\n")
+            try:
+                if os.name != "nt":
+                    os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
+                else:
+                    self.proc.terminate()
+            except Exception as e:
+                self._append_log(f"[manager] SIGTERM error: {e}\n")
+
+            try:
+                self.proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                self._append_log("[manager] SIGTERM timeout, sending SIGKILL.\n")
+                try:
+                    if os.name != "nt":
+                        os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                    else:
+                        self.proc.kill()
+                except Exception as e:
+                    self._append_log(f"[manager] SIGKILL error: {e}\n")
+
+                try:
+                    self.proc.wait(timeout=5)
+                except Exception:
+                    pass
+
+        self.proc = None
+        self.current_model = None
+        self.reader_thread = None
+
+    def start_server_async(
+        self,
+        model_name: str,
+        enable_aiter: bool = False,
+        use_v1: bool = True,
+        tensor_parallel_size: int = 1,
+        selected_gpu_indices: Optional[List[int]] = None,
+        gpu_memory_utilization: float = 0.5,
+    ):
+        same_runtime = (
+            self.current_model == model_name
+            and self.is_model_loaded()
+            and self._current_enable_aiter == enable_aiter
+            and self._current_use_v1 == use_v1
+            and self._current_tensor_parallel_size == tensor_parallel_size
+            and self._selected_gpu_indices == selected_gpu_indices
+            and getattr(self, "_current_gpu_memory_utilization", None) == gpu_memory_utilization
+        )
+        if same_runtime:
+            self._append_log(
+                f"[manager] Model {model_name} is already ready with identical runtime settings.\n"
+            )
+            return
+
+        # Validation: nb GPUs sélectionnés vs TP
+        if selected_gpu_indices is not None:
+            n_selected = len(selected_gpu_indices)
+        else:
+            n_selected = max(1, self.get_available_gpu_count())
+
+        if tensor_parallel_size < 1:
+            raise ValueError("Tensor parallel size must be >= 1.")
+        if tensor_parallel_size > n_selected:
+            raise ValueError(
+                f"Requested TP={tensor_parallel_size} but only {n_selected} GPU(s) selected."
+            )
+
+        self.stop_server()
+        self.clear_logs()
+
+        env = os.environ.copy()
+        env["HF_HOME"] = HF_HOME
+        env["VLLM_ROCM_USE_AITER"] = "1" if enable_aiter else "0"
+        env["VLLM_USE_V1"] = "1" if use_v1 else "0"
+
+        # Injecter HIP_VISIBLE_DEVICES si une sélection explicite est faite.
+        #
+        # ROCm remape les indices sélectionnés en 0, 1, 2... dans le process enfant.
+        # Ex: HIP_VISIBLE_DEVICES=1,3 -> vLLM voit device 0 et device 1.
+        #
+        # IMPORTANT: on ne touche PAS a ROCR_VISIBLE_DEVICES et on supprime toute
+        # valeur heritee pour eviter un double masquage conflictuel. HIP_VISIBLE_DEVICES
+        # suffit et est la variable canonique pour ROCm >= 5.x.
+        if selected_gpu_indices is not None:
+            hip_val = ",".join(str(i) for i in sorted(selected_gpu_indices))
+            env["HIP_VISIBLE_DEVICES"] = hip_val
+            # Supprimer ROCR_VISIBLE_DEVICES pour eviter tout conflit de masquage
+            env.pop("ROCR_VISIBLE_DEVICES", None)
+        else:
+            # Pas de selection UI -> on respecte ce qui etait dans l'environnement
+            pass
+
+        cmd = [
+            "vllm",
+            "serve",
+            model_name,
+            "--host",
+            VLLM_HOST,
+            "--port",
+            str(VLLM_PORT),
+            "--api-key",
+            VLLM_API_KEY,
+            "--dtype",
+            DEFAULT_DTYPE,
+            "--max-model-len",
+            str(DEFAULT_MAX_MODEL_LEN),
+            "--gpu-memory-utilization",
+            str(gpu_memory_utilization),
+            "--tensor-parallel-size",
+            str(tensor_parallel_size),
+        ]
+
+        self._append_log(f"[manager] Launching: {' '.join(cmd)}\n")
+        self._append_log(f"[manager] HF_HOME={HF_HOME}\n")
+        self._append_log(f"[manager] HIP_VISIBLE_DEVICES={env.get('HIP_VISIBLE_DEVICES', '(unset)')}\n")
+        self._append_log(f"[manager] ROCR_VISIBLE_DEVICES={env.get('ROCR_VISIBLE_DEVICES', '(removed/unset)')}\n")
+        self._append_log(f"[manager] VLLM_ROCM_USE_AITER={env['VLLM_ROCM_USE_AITER']}\n")
+        self._append_log(f"[manager] VLLM_USE_V1={env['VLLM_USE_V1']}\n")
+        self._append_log(f"[manager] selected_gpus={selected_gpu_indices if selected_gpu_indices is not None else 'all'}\n")
+
+        selected_bdfs = self._get_selected_bdfs()
+        if selected_bdfs is None:
+            self._append_log("[manager] selected_bdfs=(no filtering)\n\n")
+        else:
+            self._append_log(f"[manager] selected_bdfs={sorted(selected_bdfs)}\n\n")
+
+        self.proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            preexec_fn=os.setsid if os.name != "nt" else None,
+        )
+
+        self.current_model = model_name
+        self._current_enable_aiter = enable_aiter
+        self._current_use_v1 = use_v1
+        self._current_tensor_parallel_size = tensor_parallel_size
+        self._selected_gpu_indices = selected_gpu_indices
+        self._current_gpu_memory_utilization = gpu_memory_utilization
+
+        self.reader_thread = threading.Thread(target=self._reader, daemon=True)
+        self.reader_thread.start()

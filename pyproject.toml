@@ -1,0 +1,19 @@
+[project]
+name = "arno-vllm-chat"
+version = "0.1.0"
+description = "Chat UI en Gradio avec backend vLLM sur ROCm"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "vllm",
+    "gradio",
+    "openai",
+    "requests",
+]
+
+[[tool.uv.index]]
+name = "vllm-rocm"
+url = "https://wheels.vllm.ai/rocm/"
+
+[tool.uv.sources]
+vllm = { index = "vllm-rocm" }

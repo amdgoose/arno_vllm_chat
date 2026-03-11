@@ -245,13 +245,18 @@ class VLLMManager:
                 def to_gb(v):
                     return round(v / (1024 ** 3), 1)
 
-                label = f"GPU {idx} ({card.name}) — {to_gb(total):.0f} GB total"
+                used_pct = (used / total * 100.0) if total > 0 else 0.0
+                label = (
+                    f"GPU {idx} ({card.name}) — "
+                    f"{to_gb(used):.1f}/{to_gb(total):.0f} GB used ({used_pct:.0f}%)"
+                )
                 gpus.append({
                     "index": idx,
                     "card": card.name,
                     "total_gb": to_gb(total),
                     "used_gb": to_gb(used),
                     "free_gb": to_gb(free),
+                    "used_pct": used_pct,
                     "label": label,
                 })
                 idx += 1

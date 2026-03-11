@@ -46,6 +46,16 @@ def _get_all_gpu_labels() -> List[str]:
     return [g["label"] for g in manager.get_all_gpu_list()]
 
 
+def _remap_gpu_selection(old_selected: List[str], new_labels: List[str]) -> List[str]:
+    """Re-select GPUs in new_labels that match the indices from old_selected."""
+    import re
+    old_indices = set(_parse_gpu_indices_from_labels(old_selected) or [])
+    if not old_indices:
+        return new_labels
+    result = [l for l in new_labels if re.match(r"GPU\s+(\d+)", l) and int(re.match(r"GPU\s+(\d+)", l).group(1)) in old_indices]
+    return result if result else new_labels
+
+
 def help_label(title: str, tooltip: str) -> str:
     return f"""
     <div class="help-label">
@@ -57,37 +67,6 @@ def help_label(title: str, tooltip: str) -> str:
     </div>
     """
 
-
-def _empty_metrics_row() -> Dict[str, str]:
-    return {
-        "TTFT (ms)": "-",
-        "Decode throughput (tok/s)": "-",
-        "E2E latency (s)": "-",
-        "Prompt tokens": "-",
-        "Completion tokens": "-",
-        "Total tokens": "-",
-    }
-
-
-def _format_metrics(metrics: Dict[str, Any]) -> Dict[str, str]:
-    if not metrics:
-        return _empty_metrics_row()
-
-    def fmt(value: Any, precision: int = 2) -> str:
-        if value is None:
-            return "-"
-        if isinstance(value, (int, float)):
-            return f"{value:.{precision}f}"
-        return str(value)
-
-    return {
-        "TTFT (ms)": fmt(metrics.get("ttft_ms"), 2),
-        "Decode throughput (tok/s)": fmt(metrics.get("throughput_tps"), 2),
-        "E2E latency (s)": fmt(metrics.get("e2e_latency_s"), 3),
-        "Prompt tokens": fmt(metrics.get("prompt_tokens"), 0),
-        "Completion tokens": fmt(metrics.get("completion_tokens"), 0),
-        "Total tokens": fmt(metrics.get("total_tokens"), 0),
-    }
 
 
 def _build_benchmark_row(
@@ -121,27 +100,62 @@ def _build_benchmark_row(
     }
 
 
-def _history_dataframe_rows(history_rows: List[Dict[str, Any]]) -> List[List[Any]]:
-    return [
-        [
-            row["model_label"],
-            row["engine"],
-            row["aiter"],
-            row["tp"],
-            row["eager"],
-            row["gpu_util"],
-            row["temperature"],
-            row["max_tokens"],
-            row["ttft_ms"],
-            row["throughput_tps"],
-            row["e2e_latency_s"],
-            row["prompt_tokens"],
-            row["completion_tokens"],
-            row["total_tokens"],
-            row["per_gpu_used_gb"],
-        ]
-        for row in history_rows
-    ]
+_BENCH_HEADERS = [
+    ("Model",               "Logical model selector. The displayed label maps to a concrete Hugging Face model ID used by the vLLM OpenAI-compatible server."),
+    ("Engine",              "Core vLLM execution path. V1 is the default modern engine with the newer scheduler and KV-cache stack. V0 is a legacy compatibility path."),
+    ("AITER",               "Enables ROCm AITER kernels (VLLM_ROCM_USE_AITER=1). Can replace default kernels with optimized ROCm implementations for attention, GEMM, MoE and normalization paths."),
+    ("TP",                  "Number of shards used for tensor parallelism. Should not exceed the number of visible GPUs."),
+    ("Eager",               "Disables CUDA/HIP graph compilation (--enforce-eager). Strongly recommended for TP>1 on ROCm: avoids compilation timeouts and speeds up startup. Slight runtime performance loss but much more stable."),
+    ("GPU util",            "Fraction of GPU VRAM reserved for vLLM (model weights + KV cache). A lower value leaves more memory free but reduces KV cache size."),
+    ("Temperature",         "Softmax temperature applied during sampling. Higher values flatten the output distribution; lower values make decoding more deterministic."),
+    ("Max tokens",          "Upper bound on generated completion length. Directly affects decode time, KV-cache growth and end-to-end latency."),
+    ("TTFT (ms)",           "Time To First Token: wall-clock delay between request submission and arrival of the first decoded token. Captures prefill cost and scheduling overhead."),
+    ("Throughput (tok/s)",  "Generation throughput: completion_tokens / decode_duration (first to last token). Isolates steady-state decode performance from prefill."),
+    ("E2E latency (s)",     "Total wall-clock latency from request dispatch to completion of the full streamed response, including prefill, decode and bookkeeping."),
+    ("Prompt tokens",       "Number of tokens in the prompt after chat template expansion and tokenization. Strongly influences prefill latency and KV-cache footprint."),
+    ("Completion tokens",   "Number of output tokens generated for the current request. Used with decode duration to compute generation throughput."),
+    ("Total tokens",        "Sum of prompt tokens and completion tokens reported by the OpenAI-compatible response usage object."),
+    ("Per-GPU VRAM",        "Per-device VRAM usage snapshot at generation time. Helps identify imbalance across GPUs and observe the impact of tensor parallelism."),
+]
+
+
+def _bench_header_cell(label: str, tip: str) -> str:
+    escaped_tip = html.escape(tip, quote=True)
+    icon = f'<span class="help-icon help-icon-th" data-tip="{escaped_tip}" tabindex="0">?</span>'
+    return f"<th>{html.escape(label)}{icon}</th>"
+
+
+def _render_benchmark_html(history_rows: List[Dict[str, Any]]) -> str:
+    head = "".join(_bench_header_cell(label, tip) for label, tip in _BENCH_HEADERS)
+    if not history_rows:
+        body = f'<tr><td colspan="{len(_BENCH_HEADERS)}" style="text-align:center;color:#6b7280;padding:12px">No data yet — send a message to record a run.</td></tr>'
+    else:
+        body = ""
+        for row in history_rows:
+            cells = [
+                row["model_label"],
+                row["engine"],
+                row["aiter"],
+                row["tp"],
+                row["eager"],
+                row["gpu_util"],
+                row["temperature"],
+                row["max_tokens"],
+                row["ttft_ms"],
+                row["throughput_tps"],
+                row["e2e_latency_s"],
+                row["prompt_tokens"],
+                row["completion_tokens"],
+                row["total_tokens"],
+                row["per_gpu_used_gb"],
+            ]
+            row_cells = "".join(
+                f'<td class="vram-cell">{html.escape(str(c))}</td>' if i == len(cells) - 1
+                else f"<td>{html.escape(str(c))}</td>"
+                for i, c in enumerate(cells)
+            )
+            body += "<tr>" + row_cells + "</tr>"
+    return f'<div id="benchmark_html_table"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
 def load_model(selected_label: str, enable_aiter: bool, engine_version: str, tp_size: str, selected_gpu_labels: List[str], gpu_memory_utilization: float, enforce_eager: bool):
@@ -173,10 +187,12 @@ def unload_model():
         return f"❌ Failed to unload vLLM: {e}", gr.update(interactive=False)
 
 
-def refresh_status_and_logs():
+def refresh_status_and_logs(selected_gpu_labels: List[str] = None):
     status = manager.get_status()
     ready = manager.is_model_loaded()
-    return status, gr.update(interactive=ready)
+    new_labels = _get_all_gpu_labels()
+    new_selected = _remap_gpu_selection(selected_gpu_labels or [], new_labels)
+    return status, gr.update(interactive=ready), gr.update(choices=new_labels, value=new_selected)
 
 
 def refresh_gpu_controls():
@@ -208,7 +224,7 @@ def refresh_gpu_memory_boxes(selected_gpu_labels: List[str] = None):
 
 
 def clear_benchmark_history():
-    return [], []
+    return [], _render_benchmark_html([])
 
 
 def chat_fn(
@@ -230,8 +246,7 @@ def chat_fn(
             chat_history,
             chat_history,
             benchmark_history,
-            _history_dataframe_rows(benchmark_history),
-            *_empty_metrics_row().values(),
+            _render_benchmark_html(benchmark_history),
             "",
         )
 
@@ -248,8 +263,7 @@ def chat_fn(
             updated_chat,
             updated_chat,
             benchmark_history,
-            _history_dataframe_rows(benchmark_history),
-            *_empty_metrics_row().values(),
+            _render_benchmark_html(benchmark_history),
             "",
         )
 
@@ -272,8 +286,7 @@ def chat_fn(
             updated_chat,
             updated_chat,
             benchmark_history,
-            _history_dataframe_rows(benchmark_history),
-            *_empty_metrics_row().values(),
+            _render_benchmark_html(benchmark_history),
             "",
         )
 
@@ -357,19 +370,11 @@ def chat_fn(
             gpu_memory_utilization=gpu_memory_utilization,
         )
     )
-    metric_row = _format_metrics(metrics)
-
     return (
         updated_chat,
         updated_chat,
         updated_benchmark_history,
-        _history_dataframe_rows(updated_benchmark_history),
-        metric_row["TTFT (ms)"],
-        metric_row["Decode throughput (tok/s)"],
-        metric_row["E2E latency (s)"],
-        metric_row["Prompt tokens"],
-        metric_row["Completion tokens"],
-        metric_row["Total tokens"],
+        _render_benchmark_html(updated_benchmark_history),
         "",
     )
 
@@ -399,7 +404,7 @@ with gr.Blocks(title="Chat vLLM ROCm") as demo:
         with gr.Column(scale=2):
             gr.HTML(help_label(
                 "Visible GPUs",
-                "Sélectionnez les GPUs à utiliser pour l'inférence vLLM. Tous sont cochés par défaut. La sélection met à jour automatiquement les choix de Tensor Parallel Size et les métriques VRAM."
+                "Select the GPUs to use for vLLM inference. All are checked by default. The selection automatically updates the Tensor Parallel Size choices and VRAM metrics."
             ))
             _initial_gpu_labels = _get_all_gpu_labels()
             gpu_selector = gr.CheckboxGroup(
@@ -443,7 +448,7 @@ with gr.Blocks(title="Chat vLLM ROCm") as demo:
         with gr.Column(scale=1):
             gr.HTML(help_label(
                 "Enforce Eager",
-                "Désactive la compilation CUDA/HIP graphs (--enforce-eager). Fortement recommandé pour TP>1 sur ROCm : évite les timeouts de compilation et accélère le démarrage. Légère perte de performance au runtime mais bien plus stable."
+                "Disables CUDA/HIP graph compilation (--enforce-eager). Strongly recommended for TP>1 on ROCm: avoids compilation timeouts and speeds up startup. Slight runtime performance loss but much more stable."
             ))
             enforce_eager = gr.Checkbox(
                 value=False,
@@ -471,7 +476,7 @@ with gr.Blocks(title="Chat vLLM ROCm") as demo:
             ))
             temperature = gr.Slider(
                 0.0,
-                1.5,
+                1.0,
                 value=0.7,
                 step=0.1,
                 show_label=False,
@@ -502,78 +507,6 @@ with gr.Blocks(title="Chat vLLM ROCm") as demo:
                 elem_id="gpu_mem_utilization",
             )
 
-    with gr.Row():
-        with gr.Column():
-            gr.HTML(help_label(
-                "TTFT (ms)",
-                "Time To First Token: wall-clock delay between request submission and arrival of the first decoded token. It captures prefill cost, scheduling overhead, graph launch latency and the first decode step."
-            ))
-            ttft_box = gr.Textbox(value="-", show_label=False, interactive=False)
-
-        with gr.Column():
-            gr.HTML(help_label(
-                "Decode throughput (tok/s)",
-                "Generation throughput measured as completion_tokens divided by decode_duration, where decode_duration starts at the first emitted token and ends at the last token. This isolates steady-state decode performance from prefill."
-            ))
-            throughput_box = gr.Textbox(value="-", show_label=False, interactive=False)
-
-        with gr.Column():
-            gr.HTML(help_label(
-                "E2E latency (s)",
-                "Total wall-clock latency from request dispatch to completion of the full streamed response, including prefill, decode and server-side bookkeeping."
-            ))
-            e2e_box = gr.Textbox(value="-", show_label=False, interactive=False)
-
-    with gr.Row():
-        with gr.Column():
-            gr.HTML(help_label(
-                "Prompt tokens",
-                "Number of tokens consumed by the prompt context after chat template expansion and tokenization. This strongly influences prefill latency and KV-cache footprint."
-            ))
-            prompt_tokens_box = gr.Textbox(value="-", show_label=False, interactive=False)
-
-        with gr.Column():
-            gr.HTML(help_label(
-                "Completion tokens",
-                "Number of output tokens generated by the model for the current request. Used together with decode duration to compute generation throughput."
-            ))
-            completion_tokens_box = gr.Textbox(value="-", show_label=False, interactive=False)
-
-        with gr.Column():
-            gr.HTML(help_label(
-                "Total tokens",
-                "Sum of prompt tokens and completion tokens reported by the OpenAI-compatible response usage object."
-            ))
-            total_tokens_box = gr.Textbox(value="-", show_label=False, interactive=False)
-
-    with gr.Row():
-        with gr.Column():
-            gr.HTML(help_label(
-                "Total VRAM (GB)",
-                "Sum of total physical VRAM capacity across the GPUs currently selected for vLLM inference through HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES."
-            ))
-            total_vram_box = gr.Textbox(value="-", show_label=False, interactive=False)
-
-        with gr.Column():
-            gr.HTML(help_label(
-                "Used VRAM (GB)",
-                "Sum of currently allocated VRAM across the GPUs currently selected for vLLM inference. This includes model weights, KV cache, runtime buffers and memory used by other GPU processes on those same selected GPUs."
-            ))
-            used_vram_box = gr.Textbox(value="-", show_label=False, interactive=False)
-
-        with gr.Column():
-            gr.HTML(help_label(
-                "Free VRAM (GB)",
-                "Computed as total VRAM minus used VRAM, restricted to the GPUs currently selected for vLLM inference."
-            ))
-            free_vram_box = gr.Textbox(value="-", show_label=False, interactive=False)
-
-    gr.HTML(help_label(
-        "Per-GPU VRAM detail",
-        "Per-device VRAM usage snapshot restricted to the GPUs currently selected for vLLM inference. This helps identify imbalance across active GPUs and observe the impact of tensor parallelism, model loading and context growth."
-    ))
-    per_gpu_vram_box = gr.Textbox(value="-", show_label=False, interactive=False)
-
     gr.Markdown(
         """
 **Benchmark history**  
@@ -581,48 +514,7 @@ One row is appended after each completed generation so you can compare models an
 """
     )
 
-    benchmark_table = gr.Dataframe(
-        headers=[
-            "Model",
-            "Engine",
-            "AITER",
-            "TP",
-            "Eager",
-            "GPU util",
-            "Temperature",
-            "Max tokens",
-            "TTFT (ms)",
-            "Throughput (tok/s)",
-            "E2E latency (s)",
-            "Prompt tokens",
-            "Completion tokens",
-            "Total tokens",
-            "Per-GPU VRAM",
-        ],
-        datatype=[
-            "str",
-            "str",
-            "str",
-            "number",
-            "str",
-            "number",
-            "number",
-            "number",
-            "number",
-            "number",
-            "number",
-            "number",
-            "number",
-            "number",
-            "str",
-        ],
-        row_count=(0, "dynamic"),
-        column_count=(15, "fixed"),
-        label="Benchmark history",
-        interactive=False,
-        wrap=True,
-        elem_id="benchmark_table",
-    )
+    benchmark_table = gr.HTML(value=_render_benchmark_html([]))
 
     with gr.Row():
         clear_bench_button = gr.Button("Clear benchmark history")
@@ -657,21 +549,53 @@ One row is appended after each completed generation so you can compare models an
         outputs=[status_box, send_button],
     )
 
-    demo.load(fn=refresh_gpu_controls, outputs=[gpu_selector, tp_dropdown])
-    demo.load(
-        fn=lambda: refresh_gpu_memory_boxes(None),
-        outputs=[total_vram_box, used_vram_box, free_vram_box, per_gpu_vram_box],
-    )
+    demo.load(fn=refresh_gpu_controls, outputs=[gpu_selector, tp_dropdown], js="""() => {
+        // --- Floating tooltip for benchmark table headers ---
+        if (!document.getElementById('bench-floater')) {
+            const floater = document.createElement('div');
+            floater.id = 'bench-floater';
+            document.body.appendChild(floater);
+
+            let hideTimer = null;
+
+            document.addEventListener('mousemove', function(e) {
+                const icon = e.target.closest('.help-icon-th');
+                if (icon) {
+                    clearTimeout(hideTimer);
+                    const text = (icon.getAttribute('data-tip') || '').trim();
+                    if (!text) return;
+                    floater.textContent = text;
+                    floater.style.display = 'block';
+                    const r = icon.getBoundingClientRect();
+                    const fw = 320;
+                    const spaceRight = window.innerWidth - r.right - 12;
+                    const left = spaceRight >= fw ? r.right + 8 : Math.max(4, r.left - fw - 8);
+                    floater.style.left = left + 'px';
+                    floater.style.top = Math.max(4, r.bottom + 6) + 'px';
+                } else {
+                    clearTimeout(hideTimer);
+                    hideTimer = setTimeout(function() { floater.style.display = 'none'; }, 80);
+                }
+            });
+        }
+
+        // --- Focus prompt box on load ---
+        function focusPromptBox() {
+            const el = document.querySelector('#prompt_box textarea, #prompt_box input');
+            if (el) {
+                el.focus();
+                try { el.setSelectionRange(el.value.length, el.value.length); } catch(e) {}
+            }
+        }
+        setTimeout(focusPromptBox, 400);
+        document.addEventListener('click', () => setTimeout(focusPromptBox, 150));
+        setInterval(() => { if (document.activeElement === document.body) focusPromptBox(); }, 1200);
+    }""")
 
     gpu_selector.change(
         fn=update_tp_from_gpu_selection,
         inputs=[gpu_selector],
         outputs=[tp_dropdown],
-    )
-    gpu_selector.change(
-        fn=refresh_gpu_memory_boxes,
-        inputs=[gpu_selector],
-        outputs=[total_vram_box, used_vram_box, free_vram_box, per_gpu_vram_box],
     )
 
     submit_inputs = [
@@ -693,12 +617,6 @@ One row is appended after each completed generation so you can compare models an
         chat_state,
         benchmark_state,
         benchmark_table,
-        ttft_box,
-        throughput_box,
-        e2e_box,
-        prompt_tokens_box,
-        completion_tokens_box,
-        total_tokens_box,
         msg,
     ]
 
@@ -714,48 +632,34 @@ One row is appended after each completed generation so you can compare models an
     timer = gr.Timer(2.0)
     timer.tick(
         fn=refresh_status_and_logs,
-        outputs=[status_box, send_button],
-    )
-    timer.tick(
-        fn=refresh_gpu_memory_boxes,
         inputs=[gpu_selector],
-        outputs=[total_vram_box, used_vram_box, free_vram_box, per_gpu_vram_box],
+        outputs=[status_box, send_button, gpu_selector],
     )
 
-    gr.HTML("""
-<script>
-function focusPromptBox() {
-    const el = document.querySelector("#prompt_box textarea, #prompt_box input");
-    if (el) {
-        el.focus();
-        const len = el.value ? el.value.length : 0;
-        try {
-            el.setSelectionRange(len, len);
-        } catch (e) {}
-    }
-}
 
-window.addEventListener("load", () => {
-    setTimeout(focusPromptBox, 400);
-});
-
-document.addEventListener("click", () => {
-    setTimeout(focusPromptBox, 150);
-});
-
-setInterval(() => {
-    if (document.activeElement === document.body) {
-        focusPromptBox();
-    }
-}, 1200);
-</script>
-""")
 
 try:
     demo.launch(
         server_name="0.0.0.0",
         server_port=7861,
         css="""
+/* Floating tooltip for benchmark table headers */
+#bench-floater {
+    display: none;
+    position: fixed;
+    z-index: 9999;
+    background: #111827;
+    color: white;
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 12px;
+    font-weight: 400;
+    line-height: 1.4;
+    max-width: 320px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.25);
+    pointer-events: none;
+}
+
 .gradio-container {
     width: 90vw ;
     max-width: 90vw ;
@@ -894,34 +798,60 @@ footer {
     background: #f0f4ff !important;
 }
 
-/* BENCHMARK TABLE */
-#benchmark_table {
-    border: 1px solid #cbd5e1 !important;
-    border-radius: 12px !important;
-    overflow: hidden !important;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.08) !important;
+/* BENCHMARK HTML TABLE — outer wrapper: visible overflow so popup is never clipped */
+#benchmark_html_table {
+    border: 1px solid #cbd5e1;
+    border-radius: 12px;
+    overflow: visible;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+    max-width: 100%;
 }
 
-#benchmark_table table {
-    border-collapse: collapse !important;
-    width: 100% !important;
+
+#benchmark_html_table table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 13px;
 }
 
-#benchmark_table table thead tr {
-    background: #dbeafe !important;
+#benchmark_html_table thead tr {
+    background: #dbeafe;
 }
 
-#benchmark_table table tbody tr:nth-child(odd) {
-    background: #f8fbff !important;
+#benchmark_html_table thead th {
+    padding: 8px 10px;
+    text-align: left;
+    font-weight: 600;
+    white-space: nowrap;
+    border: 1px solid #d6e3f5;
 }
 
-#benchmark_table table tbody tr:nth-child(even) {
-    background: #edf4ff !important;
+#benchmark_html_table tbody tr:nth-child(odd) {
+    background: #f8fbff;
 }
 
-#benchmark_table table tbody td,
-#benchmark_table table thead th {
-    border: 1px solid #d6e3f5 !important;
+#benchmark_html_table tbody tr:nth-child(even) {
+    background: #edf4ff;
+}
+
+#benchmark_html_table tbody td {
+    padding: 6px 10px;
+    border: 1px solid #d6e3f5;
+    white-space: nowrap;
+}
+
+/* BENCHMARK TABLE HEADER TOOLTIPS — handled by JS floater (position:fixed) */
+#benchmark_html_table .help-icon-th {
+    margin-left: 4px;
+    vertical-align: middle;
+    cursor: help;
+}
+
+/* Per-GPU VRAM cell: allow wrapping */
+#benchmark_html_table td.vram-cell {
+    white-space: normal;
+    word-break: break-word;
+    min-width: 160px;
 }
 """,
     )

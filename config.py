@@ -1,7 +1,7 @@
 from pathlib import Path
 
 VLLM_HOST = "127.0.0.1"
-VLLM_PORT = 8000
+VLLM_PORT = 8765
 VLLM_API_KEY = "token-abc123"
 
 HF_HOME = str(Path.home() / ".cache" / "huggingface")
@@ -18,4 +18,4 @@ AVAILABLE_MODELS = {
 
 DEFAULT_MAX_MODEL_LEN = 2048
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.70
-DEFAULT_DTYPE = "float16"
+DEFAULT_DTYPE = "auto"

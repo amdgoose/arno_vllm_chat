@@ -2,7 +2,7 @@ import atexit
 import html
 import signal
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import gradio as gr
 from openai import OpenAI
@@ -25,36 +25,55 @@ atexit.register(manager.stop_server)
 signal.signal(signal.SIGINT, cleanup_and_exit)
 signal.signal(signal.SIGTERM, cleanup_and_exit)
 
-client = OpenAI(
-    base_url=f"http://{VLLM_HOST}:{VLLM_PORT}/v1",
-    api_key=VLLM_API_KEY,
-)
+
+def get_openai_client():
+    return OpenAI(
+        base_url=f"http://{VLLM_HOST}:{VLLM_PORT}/v1",
+        api_key=VLLM_API_KEY,
+    )
 
 
-def _parse_gpu_indices_from_labels(labels: List[str]) -> List[int]:
-    """Extrait les indices GPU depuis des labels du type 'GPU 0 (card1) — 48 GB total'."""
-    indices = []
-    for label in labels:
-        import re
-        m = re.match(r"GPU\s+(\d+)", label)
-        if m:
-            indices.append(int(m.group(1)))
-    return sorted(indices) if indices else None
+# --------------------------------------------------
+# GPU helpers with stable values
+# --------------------------------------------------
+
+def _parse_gpu_indices(selected_values: Optional[List[str]]) -> Optional[List[int]]:
+    """Convertit ['0','3'] -> [0,3]."""
+    if not selected_values:
+        return None
+    result = []
+    for v in selected_values:
+        try:
+            result.append(int(v))
+        except Exception:
+            continue
+    return sorted(result) if result else None
 
 
-def _get_all_gpu_labels() -> List[str]:
-    return [g["label"] for g in manager.get_all_gpu_list()]
+def _get_all_gpu_choices() -> List[tuple[str, str]]:
+    """
+    Retourne des choix Gradio stables:
+    [(label dynamique, value stable), ...]
+    """
+    gpus = manager.get_all_gpu_list()
+    return [(g["label"], str(g["index"])) for g in gpus]
 
 
-def _remap_gpu_selection(old_selected: List[str], new_labels: List[str]) -> List[str]:
-    """Re-select GPUs in new_labels that match the indices from old_selected."""
-    import re
-    old_indices = set(_parse_gpu_indices_from_labels(old_selected) or [])
-    if not old_indices:
-        return new_labels
-    result = [l for l in new_labels if re.match(r"GPU\s+(\d+)", l) and int(re.match(r"GPU\s+(\d+)", l).group(1)) in old_indices]
-    return result if result else new_labels
+def _remap_gpu_selection(old_selected: Optional[List[str]], new_choices: List[tuple[str, str]]) -> List[str]:
+    """
+    Conserve uniquement les values stables encore présentes dans les nouveaux choix.
+    Si rien n'est conservé, tout sélectionner par défaut.
+    """
+    available_values = {value for _, value in new_choices}
+    kept = [v for v in (old_selected or []) if v in available_values]
+    if kept:
+        return kept
+    return [value for _, value in new_choices]
 
+
+# --------------------------------------------------
+# UI helpers
+# --------------------------------------------------
 
 def help_label(title: str, tooltip: str) -> str:
     return f"""
@@ -68,10 +87,12 @@ def help_label(title: str, tooltip: str) -> str:
     """
 
 
+# --------------------------------------------------
+# Benchmark table
+# --------------------------------------------------
 
 def _build_benchmark_row(
     selected_label: str,
-    use_v1: bool,
     enable_aiter: bool,
     tp_size: str,
     temperature: float,
@@ -83,7 +104,6 @@ def _build_benchmark_row(
 ) -> Dict[str, Any]:
     return {
         "model_label": selected_label,
-        "engine": "V1" if use_v1 else "V0",
         "aiter": "on" if enable_aiter else "off",
         "tp": int(tp_size),
         "eager": "yes" if enforce_eager else "no",
@@ -102,7 +122,6 @@ def _build_benchmark_row(
 
 _BENCH_HEADERS = [
     ("Model",               "Logical model selector. The displayed label maps to a concrete Hugging Face model ID used by the vLLM OpenAI-compatible server."),
-    ("Engine",              "Core vLLM execution path. V1 is the default modern engine with the newer scheduler and KV-cache stack. V0 is a legacy compatibility path."),
     ("AITER",               "Enables ROCm AITER kernels (VLLM_ROCM_USE_AITER=1). Can replace default kernels with optimized ROCm implementations for attention, GEMM, MoE and normalization paths."),
     ("TP",                  "Number of shards used for tensor parallelism. Should not exceed the number of visible GPUs."),
     ("Eager",               "Disables CUDA/HIP graph compilation (--enforce-eager). Strongly recommended for TP>1 on ROCm: avoids compilation timeouts and speeds up startup. Slight runtime performance loss but much more stable."),
@@ -134,7 +153,6 @@ def _render_benchmark_html(history_rows: List[Dict[str, Any]]) -> str:
         for row in history_rows:
             cells = [
                 row["model_label"],
-                row["engine"],
                 row["aiter"],
                 row["tp"],
                 row["eager"],
@@ -158,15 +176,24 @@ def _render_benchmark_html(history_rows: List[Dict[str, Any]]) -> str:
     return f'<div id="benchmark_html_table"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
-def load_model(selected_label: str, enable_aiter: bool, engine_version: str, tp_size: str, selected_gpu_labels: List[str], gpu_memory_utilization: float, enforce_eager: bool):
+# --------------------------------------------------
+# Model actions
+# --------------------------------------------------
+
+def load_model(
+    selected_label: str,
+    enable_aiter: bool,
+    tp_size: str,
+    selected_gpu_values: List[str],
+    gpu_memory_utilization: float,
+    enforce_eager: bool,
+):
     model_id = AVAILABLE_MODELS[selected_label]
-    use_v1 = engine_version == "V1"
-    selected_gpu_indices = _parse_gpu_indices_from_labels(selected_gpu_labels)
+    selected_gpu_indices = _parse_gpu_indices(selected_gpu_values)
     try:
         manager.start_server_async(
             model_name=model_id,
             enable_aiter=enable_aiter,
-            use_v1=use_v1,
             tensor_parallel_size=int(tp_size),
             selected_gpu_indices=selected_gpu_indices,
             gpu_memory_utilization=gpu_memory_utilization,
@@ -187,45 +214,45 @@ def unload_model():
         return f"❌ Failed to unload vLLM: {e}", gr.update(interactive=False)
 
 
-def refresh_status_and_logs(selected_gpu_labels: List[str] = None):
+# --------------------------------------------------
+# Refresh
+# --------------------------------------------------
+
+def refresh_status_and_logs(selected_gpu_values: Optional[List[str]] = None):
     status = manager.get_status()
     ready = manager.is_model_loaded()
-    new_labels = _get_all_gpu_labels()
-    new_selected = _remap_gpu_selection(selected_gpu_labels or [], new_labels)
-    return status, gr.update(interactive=ready), gr.update(choices=new_labels, value=new_selected)
+    new_choices = _get_all_gpu_choices()
+    new_selected = _remap_gpu_selection(selected_gpu_values or [], new_choices)
+    return status, gr.update(interactive=ready), gr.update(choices=new_choices, value=new_selected)
 
 
 def refresh_gpu_controls():
-    all_labels = _get_all_gpu_labels()
+    all_choices = _get_all_gpu_choices()
     info = manager.get_runtime_info()
     tp_choices = [str(x) for x in info["tp_choices"]]
     return (
-        gr.update(choices=all_labels, value=all_labels),  # tout coché par défaut
+        gr.update(choices=all_choices, value=[value for _, value in all_choices]),
         gr.update(choices=tp_choices, value=str(info["default_tp"])),
     )
 
 
-def update_tp_from_gpu_selection(selected_gpu_labels: List[str]):
-    """Met à jour les choix TP en fonction du nombre de GPUs sélectionnés."""
-    n = max(1, len(selected_gpu_labels)) if selected_gpu_labels else 1
+def update_tp_from_gpu_selection(selected_gpu_values: List[str]):
+    n = max(1, len(selected_gpu_values)) if selected_gpu_values else 1
     tp_choices = [str(x) for x in range(1, n + 1)]
     return gr.update(choices=tp_choices, value="1")
-
-
-def refresh_gpu_memory_boxes(selected_gpu_labels: List[str] = None):
-    gpu_indices = _parse_gpu_indices_from_labels(selected_gpu_labels) if selected_gpu_labels else None
-    mem = manager.get_gpu_memory_summary(gpu_indices=gpu_indices)
-    return (
-        str(mem["total_gb"]),
-        str(mem["used_gb"]),
-        str(mem["free_gb"]),
-        mem["per_gpu"],
-    )
 
 
 def clear_benchmark_history():
     return [], _render_benchmark_html([])
 
+
+def clear_chat_history():
+    return []
+
+
+# --------------------------------------------------
+# Chat
+# --------------------------------------------------
 
 def chat_fn(
     message: str,
@@ -235,9 +262,8 @@ def chat_fn(
     temperature: float,
     max_tokens: int,
     enable_aiter: bool,
-    engine_version: str,
     tp_size: str,
-    selected_gpu_labels: List[str],
+    selected_gpu_values: List[str],
     enforce_eager: bool,
     gpu_memory_utilization: float,
 ):
@@ -251,10 +277,28 @@ def chat_fn(
         )
 
     model_id = AVAILABLE_MODELS[selected_label]
-    use_v1 = engine_version == "V1"
 
-    if manager.current_model != model_id or not manager.is_model_loaded():
+    if not manager.is_model_loaded():
         error_text = "The selected model is not ready yet. Please load it first and wait until vLLM is fully ready."
+        updated_chat = list(chat_history) + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": error_text},
+        ]
+        return (
+            updated_chat,
+            updated_chat,
+            benchmark_history,
+            _render_benchmark_html(benchmark_history),
+            "",
+        )
+
+    if manager.current_model != model_id:
+        error_text = (
+            f"A different model is currently loaded in vLLM.\n"
+            f"Selected in UI: {model_id}\n"
+            f"Currently loaded: {manager.current_model}\n"
+            f"Reload the selected model, or switch the dropdown to the loaded one."
+        )
         updated_chat = list(chat_history) + [
             {"role": "user", "content": message},
             {"role": "assistant", "content": error_text},
@@ -270,13 +314,12 @@ def chat_fn(
     runtime_cfg = manager.current_runtime_config()
     expected_cfg = {
         "enable_aiter": enable_aiter,
-        "use_v1": use_v1,
         "tensor_parallel_size": int(tp_size),
     }
     if runtime_cfg != expected_cfg:
         mismatch_text = (
             "The active vLLM server configuration does not match the UI options. "
-            "Reload the model to apply the selected engine/AITER/TP settings."
+            "Reload the model to apply the selected AITER/TP settings."
         )
         updated_chat = list(chat_history) + [
             {"role": "user", "content": message},
@@ -299,42 +342,65 @@ def chat_fn(
 
     messages.append({"role": "user", "content": message})
 
+    client = get_openai_client()
+
     start_time = time.perf_counter()
     first_token_time = None
     answer_chunks: List[str] = []
     usage = None
 
-    stream = client.chat.completions.create(
-        model=model_id,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        stream=True,
-        stream_options={"include_usage": True},
-    )
+    try:
+        stream = client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
 
-    for chunk in stream:
-        chunk_usage = getattr(chunk, "usage", None)
-        if chunk_usage is not None:
-            usage = chunk_usage
-        if not getattr(chunk, "choices", None):
-            continue
-        delta = chunk.choices[0].delta
-        token_text = getattr(delta, "content", None)
-        if token_text:
-            if first_token_time is None:
-                first_token_time = time.perf_counter()
-            answer_chunks.append(token_text)
+        for chunk in stream:
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage is not None:
+                usage = chunk_usage
+
+            if not getattr(chunk, "choices", None):
+                continue
+
+            delta = chunk.choices[0].delta
+            token_text = getattr(delta, "content", None)
+            if token_text:
+                if first_token_time is None:
+                    first_token_time = time.perf_counter()
+                answer_chunks.append(token_text)
+
+    except Exception as e:
+        error_text = f"Generation failed: {e}"
+        updated_chat = list(chat_history) + [
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": error_text},
+        ]
+        return (
+            updated_chat,
+            updated_chat,
+            benchmark_history,
+            _render_benchmark_html(benchmark_history),
+            "",
+        )
 
     end_time = time.perf_counter()
-    answer = "".join(answer_chunks)
+    answer = "".join(answer_chunks).strip()
+
+    if not answer:
+        answer = "(Empty response)"
 
     if first_token_time is None:
         first_token_time = end_time
 
-    prompt_tokens = getattr(usage, "prompt_tokens", None)
-    completion_tokens = getattr(usage, "completion_tokens", None)
-    total_tokens = getattr(usage, "total_tokens", None)
+    prompt_tokens = getattr(usage, "prompt_tokens", 0) if usage is not None else 0
+    completion_tokens = getattr(usage, "completion_tokens", 0) if usage is not None else 0
+    total_tokens = getattr(usage, "total_tokens", 0) if usage is not None else 0
+
     decode_duration = max(end_time - first_token_time, 1e-9)
     completion_tokens_value = int(completion_tokens or 0)
 
@@ -348,18 +414,18 @@ def chat_fn(
     }
 
     vram_snapshot = manager.get_gpu_memory_snapshot_for_benchmark(
-        gpu_indices=_parse_gpu_indices_from_labels(selected_gpu_labels)
+        gpu_indices=_parse_gpu_indices(selected_gpu_values)
     )
 
     updated_chat = list(chat_history) + [
         {"role": "user", "content": message},
         {"role": "assistant", "content": answer},
     ]
+
     updated_benchmark_history = list(benchmark_history)
     updated_benchmark_history.append(
         _build_benchmark_row(
             selected_label,
-            use_v1,
             enable_aiter,
             tp_size,
             temperature,
@@ -370,6 +436,7 @@ def chat_fn(
             gpu_memory_utilization=gpu_memory_utilization,
         )
     )
+
     return (
         updated_chat,
         updated_chat,
@@ -378,6 +445,10 @@ def chat_fn(
         "",
     )
 
+
+# --------------------------------------------------
+# UI
+# --------------------------------------------------
 
 with gr.Blocks(title="Chat vLLM ROCm") as demo:
     gr.Markdown("# Chat local vLLM + Gradio + ROCm")
@@ -406,10 +477,10 @@ with gr.Blocks(title="Chat vLLM ROCm") as demo:
                 "Visible GPUs",
                 "Select the GPUs to use for vLLM inference. All are checked by default. The selection automatically updates the Tensor Parallel Size choices and VRAM metrics."
             ))
-            _initial_gpu_labels = _get_all_gpu_labels()
+            _initial_gpu_choices = _get_all_gpu_choices()
             gpu_selector = gr.CheckboxGroup(
-                choices=_initial_gpu_labels,
-                value=_initial_gpu_labels,
+                choices=_initial_gpu_choices,
+                value=[value for _, value in _initial_gpu_choices],
                 show_label=False,
                 elem_id="gpu_selector",
             )
@@ -421,17 +492,6 @@ with gr.Blocks(title="Chat vLLM ROCm") as demo:
             tp_dropdown = gr.Dropdown(
                 choices=["1"],
                 value="1",
-                show_label=False,
-            )
-
-        with gr.Column(scale=1):
-            gr.HTML(help_label(
-                "vLLM engine",
-                "Core vLLM execution path. V1 is the default modern engine with the newer scheduler and KV-cache stack. V0 is a legacy compatibility path and may be unavailable in newer vLLM releases."
-            ))
-            engine_version = gr.Dropdown(
-                choices=["V1", "V0"],
-                value="V1",
                 show_label=False,
             )
 
@@ -518,7 +578,7 @@ One row is appended after each completed generation so you can compare models an
 
     with gr.Row():
         clear_bench_button = gr.Button("Clear benchmark history")
-        clear_chat_button = gr.ClearButton(value="Clear chat", components=[])
+        clear_chat_button = gr.Button("Clear chat")
 
     with gr.Group(elem_id="chat_panel"):
         gr.HTML("<div class='section-title'>Chat</div>")
@@ -534,12 +594,19 @@ One row is appended after each completed generation so you can compare models an
         )
         send_button = gr.Button("Send", variant="primary", elem_id="send_button", interactive=False)
 
-    clear_chat_button.add([chatbot, msg])
-    clear_chat_button.click(lambda: [], outputs=[chat_state])
+    clear_chat_button.click(
+        fn=clear_chat_history,
+        inputs=[],
+        outputs=[chat_state],
+    ).then(
+        fn=lambda: [],
+        inputs=[],
+        outputs=[chatbot],
+    )
 
     load_button.click(
         fn=load_model,
-        inputs=[model_dropdown, enable_aiter, engine_version, tp_dropdown, gpu_selector, gpu_mem_utilization, enforce_eager],
+        inputs=[model_dropdown, enable_aiter, tp_dropdown, gpu_selector, gpu_mem_utilization, enforce_eager],
         outputs=[status_box, send_button],
     )
 
@@ -549,8 +616,10 @@ One row is appended after each completed generation so you can compare models an
         outputs=[status_box, send_button],
     )
 
-    demo.load(fn=refresh_gpu_controls, outputs=[gpu_selector, tp_dropdown], js="""() => {
-        // --- Floating tooltip for benchmark table headers ---
+    demo.load(
+        fn=refresh_gpu_controls,
+        outputs=[gpu_selector, tp_dropdown],
+        js="""() => {
         if (!document.getElementById('bench-floater')) {
             const floater = document.createElement('div');
             floater.id = 'bench-floater';
@@ -578,19 +647,8 @@ One row is appended after each completed generation so you can compare models an
                 }
             });
         }
-
-        // --- Focus prompt box on load ---
-        function focusPromptBox() {
-            const el = document.querySelector('#prompt_box textarea, #prompt_box input');
-            if (el) {
-                el.focus();
-                try { el.setSelectionRange(el.value.length, el.value.length); } catch(e) {}
-            }
-        }
-        setTimeout(focusPromptBox, 400);
-        document.addEventListener('click', () => setTimeout(focusPromptBox, 150));
-        setInterval(() => { if (document.activeElement === document.body) focusPromptBox(); }, 1200);
-    }""")
+    }""",
+    )
 
     gpu_selector.change(
         fn=update_tp_from_gpu_selection,
@@ -606,7 +664,6 @@ One row is appended after each completed generation so you can compare models an
         temperature,
         max_tokens,
         enable_aiter,
-        engine_version,
         tp_dropdown,
         gpu_selector,
         enforce_eager,
@@ -626,8 +683,18 @@ One row is appended after each completed generation so you can compare models an
         outputs=submit_outputs,
         concurrency_limit=1,
     )
-    msg.submit(fn=chat_fn, inputs=submit_inputs, outputs=submit_outputs)
-    clear_bench_button.click(fn=clear_benchmark_history, outputs=[benchmark_state, benchmark_table])
+    msg.submit(
+        fn=chat_fn,
+        inputs=submit_inputs,
+        outputs=submit_outputs,
+        concurrency_limit=1,
+    )
+
+    clear_bench_button.click(
+        fn=clear_benchmark_history,
+        inputs=[],
+        outputs=[benchmark_state, benchmark_table],
+    )
 
     timer = gr.Timer(2.0)
     timer.tick(
@@ -635,7 +702,6 @@ One row is appended after each completed generation so you can compare models an
         inputs=[gpu_selector],
         outputs=[status_box, send_button, gpu_selector],
     )
-
 
 
 try:
@@ -661,11 +727,11 @@ try:
 }
 
 .gradio-container {
-    width: 90vw ;
-    max-width: 90vw ;
-    margin: 0 auto ;
-    padding-left: 8px ;
-    padding-right: 8px ;
+    width: 90vw;
+    max-width: 90vw;
+    margin: 0 auto;
+    padding-left: 8px;
+    padding-right: 8px;
 }
 
 footer {
@@ -798,7 +864,7 @@ footer {
     background: #f0f4ff !important;
 }
 
-/* BENCHMARK HTML TABLE — outer wrapper: visible overflow so popup is never clipped */
+/* BENCHMARK HTML TABLE */
 #benchmark_html_table {
     border: 1px solid #cbd5e1;
     border-radius: 12px;
@@ -806,7 +872,6 @@ footer {
     box-shadow: 0 4px 14px rgba(0,0,0,0.08);
     max-width: 100%;
 }
-
 
 #benchmark_html_table table {
     border-collapse: collapse;
@@ -840,14 +905,12 @@ footer {
     white-space: nowrap;
 }
 
-/* BENCHMARK TABLE HEADER TOOLTIPS — handled by JS floater (position:fixed) */
 #benchmark_html_table .help-icon-th {
     margin-left: 4px;
     vertical-align: middle;
     cursor: help;
 }
 
-/* Per-GPU VRAM cell: allow wrapping */
 #benchmark_html_table td.vram-cell {
     white-space: normal;
     word-break: break-word;

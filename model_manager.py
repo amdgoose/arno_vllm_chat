@@ -28,9 +28,10 @@ class VLLMManager:
         self.log_lock = threading.Lock()
         self.reader_thread = None
         self._current_enable_aiter = False
-        self._current_use_v1 = True
         self._current_tensor_parallel_size = 1
-        self._selected_gpu_indices: Optional[List[int]] = None  # None = tous les GPUs
+        self._selected_gpu_indices: Optional[List[int]] = None
+        self._current_gpu_memory_utilization = DEFAULT_GPU_MEMORY_UTILIZATION
+        self._current_enforce_eager = False
 
     def _append_log(self, line: str):
         with self.log_lock:
@@ -48,7 +49,6 @@ class VLLMManager:
     def current_runtime_config(self) -> Dict[str, object]:
         return {
             "enable_aiter": self._current_enable_aiter,
-            "use_v1": self._current_use_v1,
             "tensor_parallel_size": self._current_tensor_parallel_size,
         }
 
@@ -98,9 +98,9 @@ class VLLMManager:
         logs = self.get_logs()
         runtime = self.current_runtime_config()
         runtime_summary = (
-            f"model={self.current_model} | engine={'V1' if runtime['use_v1'] else 'V0'} "
-            f"| AITER={'on' if runtime['enable_aiter'] else 'off'} "
-            f"| TP={runtime['tensor_parallel_size']}"
+            f"model={self.current_model} | "
+            f"AITER={'on' if runtime['enable_aiter'] else 'off'} | "
+            f"TP={runtime['tensor_parallel_size']}"
         )
 
         if ret is not None:
@@ -224,10 +224,7 @@ class VLLMManager:
         """
         Retourne la liste de tous les GPUs physiques détectés via /sys/class/drm,
         indépendamment de HIP_VISIBLE_DEVICES.
-        Chaque entrée: {index, card, total_gb, used_gb, free_gb, label}
         """
-        from pathlib import Path
-
         gpus = []
         drm_root = Path("/sys/class/drm")
         idx = 0
@@ -266,14 +263,6 @@ class VLLMManager:
         return gpus
 
     def _get_visible_device_indices(self) -> Optional[List[int]]:
-        """
-        Retourne les indices de GPU définis par HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES.
-
-        Exemples:
-          HIP_VISIBLE_DEVICES=1,3  -> [1, 3]
-          unset / all              -> None   (pas de filtre)
-          "" / none                -> []
-        """
         for env_name in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
             raw = os.environ.get(env_name)
             if raw is None:
@@ -303,9 +292,6 @@ class VLLMManager:
         return None
 
     def _normalize_bdf(self, bdf: str) -> str:
-        """
-        Normalise un BDF PCI au format canonique: 0000:xx:yy.z
-        """
         bdf = bdf.strip().lower().strip("[]")
 
         if re.match(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$", bdf):
@@ -317,11 +303,6 @@ class VLLMManager:
         return bdf
 
     def _get_rocm_smi_bus_map(self) -> Dict[int, str]:
-        """
-        Retourne un mapping {index_rocm: pci_bdf}
-        Exemple:
-          {0: '0000:c1:00.0', 1: '0000:c6:00.0', ...}
-        """
         rocm_smi = shutil.which("rocm-smi")
         if not rocm_smi:
             return {}
@@ -346,8 +327,6 @@ class VLLMManager:
             if not line:
                 continue
 
-            # Exemple possible:
-            # GPU[0] : PCI Bus: 0000:C1:00.0
             m1 = re.search(
                 r"GPU\[(\d+)\].*?([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])",
                 line,
@@ -357,8 +336,6 @@ class VLLMManager:
                 bus_map[idx] = self._normalize_bdf(m1.group(2))
                 continue
 
-            # Autre forme possible:
-            # 0  0000:C1:00.0
             m2 = re.match(
                 r"^(\d+)\s+([0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-9A-Fa-f])\b",
                 line,
@@ -371,10 +348,6 @@ class VLLMManager:
         return bus_map
 
     def _get_selected_bdfs(self) -> Optional[Set[str]]:
-        """
-        Retourne les BDF physiques sélectionnés selon HIP_VISIBLE_DEVICES/ROCR_VISIBLE_DEVICES.
-        None = pas de filtre.
-        """
         visible_indices = self._get_visible_device_indices()
         if visible_indices is None:
             return None
@@ -383,7 +356,6 @@ class VLLMManager:
 
         rocm_bus_map = self._get_rocm_smi_bus_map()
         if not rocm_bus_map:
-            # Fallback: pas de mapping fiable => ne pas filtrer
             return None
 
         selected = set()
@@ -394,9 +366,6 @@ class VLLMManager:
         return selected
 
     def _get_card_bdf(self, card: Path) -> Optional[str]:
-        """
-        Lit le BDF PCI correspondant à /sys/class/drm/cardX
-        """
         try:
             real_dev = (card / "device").resolve()
             return self._normalize_bdf(real_dev.name)
@@ -404,11 +373,6 @@ class VLLMManager:
             return None
 
     def get_gpu_memory_info(self, only_vllm_visible: bool = True, gpu_indices: Optional[List[int]] = None):
-        """
-        Si gpu_indices est fourni, filtre uniquement les GPUs correspondant à ces indices
-        (basé sur l'ordre de découverte dans /sys/class/drm/card*).
-        Sinon, utilise la logique HIP_VISIBLE_DEVICES habituelle.
-        """
         gpus = []
         drm_root = Path("/sys/class/drm")
         selected_bdfs = self._get_selected_bdfs() if only_vllm_visible and gpu_indices is None else None
@@ -422,7 +386,6 @@ class VLLMManager:
             if not total_file.exists() or not used_file.exists():
                 continue
 
-            # Filtre par indices explicites (sélection UI)
             if gpu_indices is not None:
                 if card_idx not in gpu_indices:
                     card_idx += 1
@@ -552,21 +515,19 @@ class VLLMManager:
         self,
         model_name: str,
         enable_aiter: bool = False,
-        use_v1: bool = True,
         tensor_parallel_size: int = 1,
         selected_gpu_indices: Optional[List[int]] = None,
-        gpu_memory_utilization: float = 0.5,
-        enforce_eager: bool = True,
+        gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION,
+        enforce_eager: bool = False,
     ):
         same_runtime = (
             self.current_model == model_name
             and self.is_model_loaded()
             and self._current_enable_aiter == enable_aiter
-            and self._current_use_v1 == use_v1
             and self._current_tensor_parallel_size == tensor_parallel_size
             and self._selected_gpu_indices == selected_gpu_indices
-            and getattr(self, "_current_gpu_memory_utilization", None) == gpu_memory_utilization
-            and getattr(self, "_current_enforce_eager", None) == enforce_eager
+            and self._current_gpu_memory_utilization == gpu_memory_utilization
+            and self._current_enforce_eager == enforce_eager
         )
         if same_runtime:
             self._append_log(
@@ -574,7 +535,6 @@ class VLLMManager:
             )
             return
 
-        # Validation: nb GPUs sélectionnés vs TP
         if selected_gpu_indices is not None:
             n_selected = len(selected_gpu_indices)
         else:
@@ -593,27 +553,14 @@ class VLLMManager:
         env = os.environ.copy()
         env["HF_HOME"] = HF_HOME
         env["VLLM_ROCM_USE_AITER"] = "1" if enable_aiter else "0"
-        env["VLLM_USE_V1"] = "1" if use_v1 else "0"
-        # Augmenter le timeout des workers pour absorber les longues compilations ROCm
-        # (par défaut 60s, insuffisant pour TP>1 sur MI200/MI300)
-        env.setdefault("VLLM_WORKER_MULTIPROC_TIMEOUT", "300")
 
-        # Injecter HIP_VISIBLE_DEVICES si une sélection explicite est faite.
-        #
-        # ROCm remape les indices sélectionnés en 0, 1, 2... dans le process enfant.
-        # Ex: HIP_VISIBLE_DEVICES=1,3 -> vLLM voit device 0 et device 1.
-        #
-        # IMPORTANT: on ne touche PAS a ROCR_VISIBLE_DEVICES et on supprime toute
-        # valeur heritee pour eviter un double masquage conflictuel. HIP_VISIBLE_DEVICES
-        # suffit et est la variable canonique pour ROCm >= 5.x.
+        env.pop("VLLM_USE_V1", None)
+        env.pop("VLLM_WORKER_MULTIPROC_TIMEOUT", None)
+
         if selected_gpu_indices is not None:
             hip_val = ",".join(str(i) for i in sorted(selected_gpu_indices))
             env["HIP_VISIBLE_DEVICES"] = hip_val
-            # Supprimer ROCR_VISIBLE_DEVICES pour eviter tout conflit de masquage
             env.pop("ROCR_VISIBLE_DEVICES", None)
-        else:
-            # Pas de selection UI -> on respecte ce qui etait dans l'environnement
-            pass
 
         cmd = [
             "vllm",
@@ -638,8 +585,6 @@ class VLLMManager:
         if enforce_eager:
             cmd.append("--enforce-eager")
 
-        # Force vLLM à ignorer le generation_config.json du modèle (température, top_k, etc.)
-        # afin que les paramètres envoyés via l'API soient effectivement respectés.
         cmd.extend(["--generation-config", "vllm"])
 
         self._append_log(f"[manager] Launching: {' '.join(cmd)}\n")
@@ -647,9 +592,7 @@ class VLLMManager:
         self._append_log(f"[manager] HIP_VISIBLE_DEVICES={env.get('HIP_VISIBLE_DEVICES', '(unset)')}\n")
         self._append_log(f"[manager] ROCR_VISIBLE_DEVICES={env.get('ROCR_VISIBLE_DEVICES', '(removed/unset)')}\n")
         self._append_log(f"[manager] VLLM_ROCM_USE_AITER={env['VLLM_ROCM_USE_AITER']}\n")
-        self._append_log(f"[manager] VLLM_USE_V1={env['VLLM_USE_V1']}\n")
         self._append_log(f"[manager] enforce_eager={enforce_eager}\n")
-        self._append_log(f"[manager] VLLM_WORKER_MULTIPROC_TIMEOUT={env['VLLM_WORKER_MULTIPROC_TIMEOUT']}\n")
         self._append_log(f"[manager] selected_gpus={selected_gpu_indices if selected_gpu_indices is not None else 'all'}\n")
 
         selected_bdfs = self._get_selected_bdfs()
@@ -671,7 +614,6 @@ class VLLMManager:
 
         self.current_model = model_name
         self._current_enable_aiter = enable_aiter
-        self._current_use_v1 = use_v1
         self._current_tensor_parallel_size = tensor_parallel_size
         self._selected_gpu_indices = selected_gpu_indices
         self._current_gpu_memory_utilization = gpu_memory_utilization
